@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/server", "crates/hackmd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+hackmd = { path = "crates/hackmd" }
+
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6"
+base64 = "0.22"
+rand = "0.9"
+sha2 = "0.10"
+url = "2"
+percent-encoding = "2"
+time = "0.3"
+
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+
+aes-gcm = "0.10"
+schemars = { version = "1", features = ["chrono04"] }
+
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs", "trace", "cors"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query", "rustls"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+dotenvy = "0.15"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
