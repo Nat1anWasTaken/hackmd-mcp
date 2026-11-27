@@ -103,7 +103,7 @@ The framework runs every `tools/call` through one path:
 4. Unseal the user's HackMD token. A missing token or one flagged
    `needs_relink` ends the call with a message telling the agent to have the
    user sign in again.
-5. Check the request's workspace against `workspace_scope`. For version tools,
+5. Check the request's workspace against the session's `scope`. For version tools,
    which name a note alone, a restricted scope looks up the note's `teamPath`
    first.
 6. Log the call as `running` and execute it in a detached task, so a client
@@ -168,7 +168,7 @@ type AgentSession = {
   enabled: boolean
   read_only: boolean
   allowed_tools: string[] | null // null = all tools
-  workspace_scope: WorkspaceScope
+  scope: WorkspaceScope // `{}` for a new session: every workspace
   created_at: string
   last_used_at: string | null
 }
@@ -212,7 +212,7 @@ type OAuthRequest = {
 | GET | `/api/tools` | — | `ToolInfo[]` |
 | GET | `/api/sessions` | — | `AgentSession[]` (active only) |
 | GET | `/api/sessions/:id` | — | `AgentSession` |
-| PATCH | `/api/sessions/:id` | partial `{name, enabled, read_only, allowed_tools, workspace_scope}` | `AgentSession` |
+| PATCH | `/api/sessions/:id` | partial `{name, enabled, read_only, allowed_tools, scope, use_outbox, outbox_ttl_minutes}` | `AgentSession` |
 | DELETE | `/api/sessions/:id` | — | `204`; revokes its tokens, keeps its log |
 | GET | `/api/tool-calls` | `session_id?, status?, before?, limit?` | `{items: ToolCall[], next_before}` |
 | GET | `/api/tool-calls/:id` | — | `ToolCall` |
