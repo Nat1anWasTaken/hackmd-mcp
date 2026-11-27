@@ -1,24 +1,42 @@
-import { StrictMode } from "react"
-import { createRoot } from "react-dom/client"
-import { QueryClientProvider } from "@tanstack/react-query"
-import { RouterProvider } from "react-router/dom"
+import {
+  mountDashboard,
+  type AgentSession,
+  type Me,
+} from "@nat1an/mcp-backbone-dashboard"
+import { Badge } from "@nat1an/mcp-backbone-dashboard/ui/badge"
 
 import "./index.css"
-import { ThemeProvider } from "@/components/theme-provider"
-import { Toaster } from "@/components/ui/sonner"
-import { TooltipProvider } from "@/components/ui/tooltip"
-import { queryClient } from "@/lib/query-client"
-import { router } from "@/router"
+import { HackmdCard } from "./hackmd-card"
+import { Login } from "./login"
+import { normalize, SessionWorkspacesCard } from "./session-workspaces-card"
+import type { LinkStatus, WorkspaceScope } from "./types"
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <ThemeProvider>
-      <QueryClientProvider client={queryClient}>
-        <TooltipProvider>
-          <RouterProvider router={router} />
-        </TooltipProvider>
-        <Toaster />
-      </QueryClientProvider>
-    </ThemeProvider>
-  </StrictMode>
-)
+mountDashboard({
+  name: "HackMD",
+  logo: "/hackmd.png",
+  login: Login,
+  loginDescription:
+    "Sign in with a HackMD API token to choose which AI agents can use your notes.",
+  linkHealth: (me: Me<unknown>) => {
+    const link = me.link as LinkStatus | null
+    if (link?.status === "ok") {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      title: link ? "HackMD rejected your token" : "No HackMD token is saved",
+      description:
+        "Agents can't reach your notes until you save a new HackMD API token on the overview.",
+    }
+  },
+  overviewCards: [HackmdCard],
+  sessionCards: [SessionWorkspacesCard],
+  sessionBadges: (session: AgentSession<Partial<WorkspaceScope>>) =>
+    normalize(session.scope).mode === "allow" && (
+      <Badge variant="outline">Limited workspaces</Badge>
+    ),
+  copy: {
+    readOnlyDescription:
+      "Blocks every tool that creates, edits or deletes notes, folders or versions.",
+  },
+})

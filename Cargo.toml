@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 hackmd = { path = "crates/hackmd" }
+mcp-backbone = "0.1.0"
 
 anyhow = "1"
 thiserror = "2"
