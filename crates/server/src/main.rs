@@ -1,91 +1,140 @@
 mod api;
 mod auth;
 mod config;
-mod crypto;
-mod error;
 mod links;
-mod mcp;
-mod net;
-mod oauth;
-mod sessions;
-mod state;
+mod scope;
+mod service;
 #[cfg(test)]
 mod testing;
-mod web;
+#[cfg(test)]
+mod tests;
+mod tools;
 
-use std::sync::Arc;
+use mcp_backbone::migrate::Adoption;
 
-use anyhow::Context;
-use axum::{Router, routing::get};
-use sqlx::postgres::PgPoolOptions;
-use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
+use crate::service::HackMdService;
 
-use crate::{config::Config, state::AppState};
+/// Brings a database from before mcp-backbone into the framework's schema.
+pub static ADOPTION: Adoption = Adoption {
+    legacy_versions: &[1],
+    before: include_str!("../../../migrations/adopt/before.sql"),
+    after: include_str!("../../../migrations/adopt/after.sql"),
+    service_baseline: None,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,hackmd_mcp=debug,hackmd=debug".into()),
-        )
-        .init();
-
-    let config = Arc::new(Config::from_env()?);
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
+    let service = HackMdService {
+        hackmd: hackmd::HackMd::new(&config::api_url()),
+    };
+    mcp_backbone::App::new(service)
+        .outbox(true)
+        .push(true)
+        .adopt(&ADOPTION)
+        .serve()
         .await
-        .context("connecting to Postgres")?;
-    sqlx::migrate!("../../migrations").run(&db).await?;
-    mcp::settle_interrupted_calls(&db).await?;
+}
 
-    let state = AppState {
-        hackmd: hackmd::HackMd::new(&config.hackmd_api_url),
-        db,
-        config: config.clone(),
-        client_assertions: Default::default(),
+#[cfg(test)]
+mod adoption_tests {
+    use mcp_backbone::{
+        crypto::sealed,
+        migrate,
+        sqlx::{self, PgPool, migrate::Migrator},
+        testing::{TempDatabase, schema},
     };
+    use serde_json::json;
+    use uuid::Uuid;
 
-    oauth::spawn_cleanup(state.db.clone());
-    let app = app(state);
+    use super::ADOPTION;
+    use crate::{scope::WorkspaceScope, testing};
 
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    tracing::info!(addr = %config.bind_addr, url = %config.public_url, "listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
-}
+    static LEGACY: Migrator = sqlx::migrate!("../../migrations/legacy");
 
-fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .merge(auth::router(state.clone()))
-        .merge(oauth::router())
-        .nest("/api", api::router(state.clone()))
-        .merge(mcp::router(state.clone()))
-        .fallback_service(web::service(&state.config.web_dist))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
+    /// A database from before mcp-backbone, with a linked user, a scoped
+    /// session and a logged call, is adopted with every row, matches a fresh
+    /// schema, and its token still opens.
+    #[sqlx::test(migrations = false)]
+    async fn legacy_databases_are_adopted(db: PgPool) {
+        LEGACY.run(&db).await.unwrap();
+        let user_id = Uuid::new_v4();
+        let token = sealed::seal(&[7; 32], user_id.as_bytes(), b"legacy-token").unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, hackmd_user_id, user_path, name, email)
+             VALUES ($1, 'hm-9', 'ada', 'Ada', 'ada@example.test')",
+        )
+        .bind(user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO hackmd_links (user_id, token_sealed, token_hash, last_ok_at)
+             VALUES ($1, $2, $3, now())",
+        )
+        .bind(user_id)
+        .bind(token)
+        .bind(mcp_backbone::links::token_hash("legacy-token"))
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO oauth_clients (client_id, redirect_uris, grant_types, source)
+             VALUES ('client', ARRAY['https://agent.example/cb'], ARRAY['authorization_code'], 'dcr');
+             INSERT INTO agent_sessions (id, user_id, client_id, name, workspace_scope)
+             VALUES ('00000000-0000-0000-0000-0000000000a1', '{user_id}', 'client', 'Claude',
+                     '{{\"mode\":\"allow\",\"personal\":false,\"teams\":[{{\"path\":\"core\",\"name\":\"Core\"}}]}}');
+             INSERT INTO tool_calls (user_id, agent_session_id, tool, arguments, status)
+             VALUES ('{user_id}', '00000000-0000-0000-0000-0000000000a1', 'hackmd_get_me', '{{}}', 'ok');"
+        )))
+        .execute(&db)
+        .await
+        .unwrap();
 
-async fn shutdown_signal() {
-    let ctrl_c = async { tokio::signal::ctrl_c().await.ok() };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
+        migrate::run(&db, None, Some(&ADOPTION)).await.unwrap();
+        migrate::run(&db, None, Some(&ADOPTION)).await.unwrap();
+
+        let fresh = TempDatabase::new(&db).await;
+        migrate::run(&fresh.pool, None, None).await.unwrap();
+        assert_eq!(schema(&db).await, schema(&fresh.pool).await);
+        fresh.drop().await;
+
+        let (subject, login, email): (String, String, String) =
+            sqlx::query_as("SELECT subject, login, email FROM users")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            (subject.as_str(), login.as_str(), email.as_str()),
+            ("hm-9", "ada", "ada@example.test")
+        );
+        let scope: serde_json::Value = sqlx::query_scalar("SELECT scope FROM agent_sessions")
+            .fetch_one(&db)
             .await
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+            .unwrap();
+        let scope: WorkspaceScope = serde_json::from_value(scope).unwrap();
+        assert!(!scope.allows(None) && scope.allows(Some("core")));
+        let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM tool_calls")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(calls, 1);
+
+        let state = testing::state(db.clone()).await;
+        let record = mcp_backbone::links::LinkStore::new(&state)
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.secret(&state, crate::links::TOKEN).unwrap(),
+            "legacy-token"
+        );
+        let status = crate::links::status(&state, user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, mcp_backbone::links::LinkState::Ok);
+        let _ = json!({});
     }
 }

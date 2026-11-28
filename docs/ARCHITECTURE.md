@@ -14,39 +14,46 @@ crates/hackmd   HackMD API v1 client: one `Account` per API token, an operation
                 per tool, request types whose doc comments become the tool
                 schemas, and the note patch engine. No HTTP serving/OAuth/MCP
                 knowledge.
-crates/server   axum app. Modules:
-  auth/         sign-in with a HackMD API token, dashboard cookie sessions,
-                `CurrentUser` extractor
-  links.rs      the user's HackMD token: sealed storage and health
-  oauth/        authorization server (metadata, DCR, CIMD, authorize, token,
-                revoke) and the bearer middleware that yields `AgentPrincipal`
-  mcp/          rmcp ServerHandler, tool registry, permission policy, call log
-  api/          dashboard JSON API
-  web.rs        static SPA serving
-migrations/     sqlx migrations (applied at startup)
-web/            Vite + React + shadcn (Base UI) dashboard
+crates/server   the mcp-backbone service (binary `hackmd-mcp`):
+  service.rs    the `Service` impl: account, error classes, workspace checks, routes
+  scope.rs      `WorkspaceScope`, a session's scope
+  tools.rs      the tool registry and what each request targets
+  auth.rs       sign-in with a HackMD API token
+  links.rs      the token in the framework's link store
+  api.rs        /api/hackmd (disconnect) and /api/hackmd/teams
+migrations/     legacy/ (the schema before mcp-backbone) and adopt/ (its one-time adoption)
+web/            the dashboard: the package, plus the token form, account card and
+                workspace picker
 ```
 
-The OAuth server, dashboard sessions, call log and dashboard follow
-`telegram-mcp` and `ilearning-mcp`; identity follows `ilearning-mcp`, where the
-upstream account is the user.
+The OAuth server, dashboard sessions, tool pipeline, permission policy, call
+log, outbox and the dashboard shell come from
+[mcp-backbone](https://github.com/Nat1anWasTaken/mcp-backbone); identity
+follows `ilearning-mcp`, where the upstream account is the user.
+
+A database from before mcp-backbone is adopted once at startup, in one
+transaction (`migrations/adopt`): users keep their IDs (the HackMD user ID
+becomes `subject`, the user path `login`), `hackmd_links` becomes a link
+whose secret `token` is the same sealed bytes, `workspace_scope` becomes the
+session's `scope`, and the call log keeps every row. Dashboard cookies stay
+valid. A test adopts a legacy database and compares it with a fresh one.
 
 ## Core concepts
 
 - **User**: a HackMD account. Signing in means pasting a HackMD API token; the
   server checks it with `GET /me` and keys the user by HackMD's user ID. There
   is no other login.
-- **Link** (`hackmd_links`): the user's API token, AES-256-GCM sealed with the
-  user ID as associated data. Status `ok`, or `needs_relink` once HackMD
+- **Link** (the framework's `links`): the user's API token, its secret
+  `token`, AES-256-GCM sealed with the user ID as associated data. Status `ok`, or `needs_relink` once HackMD
   rejected it (401); signing in again with a new token for the same account
   replaces it. Tokens are compared by SHA-256 so a stale failure never flags a
   newer token.
 - **Agent session** (`agent_sessions`): one connected MCP client (claude.ai,
   ChatGPT, Claude Code, …) for one user, created when the user approves the
   OAuth consent screen. Holds the permissions: `enabled`, `read_only` (kill
-  switch for every write tool), `allowed_tools` (NULL = all), and
-  `workspace_scope` (which workspaces it may touch: all, or the personal
-  workspace and/or listed teams). Re-authorizing the same client reuses the
+  switch for every write tool), `allowed_tools` (NULL = all), `use_outbox`,
+  and `scope` (which workspaces it may touch: all, or the personal workspace
+  and/or listed teams). Re-authorizing the same client reuses the
   active session.
 - **Tool call** (`tool_calls`): every MCP tool invocation, including denied
   ones, with bounded and redacted arguments and results.
@@ -85,7 +92,7 @@ concurrent change.
 
 ## Tool calls
 
-`mcp/pipeline.rs` runs every `tools/call` through one path:
+The framework runs every `tools/call` through one path:
 
 1. Load the session's permissions fresh from Postgres.
 2. Parse the arguments into the `hackmd` request type. The same type provides
@@ -96,7 +103,7 @@ concurrent change.
 4. Unseal the user's HackMD token. A missing token or one flagged
    `needs_relink` ends the call with a message telling the agent to have the
    user sign in again.
-5. Check the request's workspace against `workspace_scope`. For version tools,
+5. Check the request's workspace against the session's `scope`. For version tools,
    which name a note alone, a restricted scope looks up the note's `teamPath`
    first.
 6. Log the call as `running` and execute it in a detached task, so a client
@@ -161,7 +168,7 @@ type AgentSession = {
   enabled: boolean
   read_only: boolean
   allowed_tools: string[] | null // null = all tools
-  workspace_scope: WorkspaceScope
+  scope: WorkspaceScope // `{}` for a new session: every workspace
   created_at: string
   last_used_at: string | null
 }
@@ -205,7 +212,7 @@ type OAuthRequest = {
 | GET | `/api/tools` | — | `ToolInfo[]` |
 | GET | `/api/sessions` | — | `AgentSession[]` (active only) |
 | GET | `/api/sessions/:id` | — | `AgentSession` |
-| PATCH | `/api/sessions/:id` | partial `{name, enabled, read_only, allowed_tools, workspace_scope}` | `AgentSession` |
+| PATCH | `/api/sessions/:id` | partial `{name, enabled, read_only, allowed_tools, scope, use_outbox, outbox_ttl_minutes}` | `AgentSession` |
 | DELETE | `/api/sessions/:id` | — | `204`; revokes its tokens, keeps its log |
 | GET | `/api/tool-calls` | `session_id?, status?, before?, limit?` | `{items: ToolCall[], next_before}` |
 | GET | `/api/tool-calls/:id` | — | `ToolCall` |
